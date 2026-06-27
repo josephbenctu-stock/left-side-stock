@@ -55,8 +55,35 @@ TPEX_REVENUE_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap39_O"
 MARKET_INDEX_TICKER = "^TWII"
 
 REQUEST_HEADERS = {
-    "User-Agent": "Mozilla/5.0 left-side-value-stock-screener-pro/2.0",
+    # 用比較像一般瀏覽器的 UA，降低雲端環境被官方站誤判的機率。
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/125.0 Safari/537.36"
+    ),
     "Accept": "application/json,text/csv,text/plain,*/*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+}
+
+# TWSE OpenAPI 在 Streamlit Cloud 或部分雲端環境偶爾會回傳空白 / HTML，
+# 造成 json() 出現 Expecting value。這裡加入 TWSE 備援下載網址。
+URL_FALLBACKS = {
+    TWSE_PE_URL: [
+        TWSE_PE_URL,
+        "https://www.twse.com.tw/exchangeReport/BWIBBU_ALL?response=open_data",
+        "https://www.twse.com.tw/rwd/zh/exchangeReport/BWIBBU_ALL?response=open_data",
+    ],
+    TWSE_QUOTE_URL: [
+        TWSE_QUOTE_URL,
+        "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL?response=open_data",
+        "https://www.twse.com.tw/rwd/zh/exchangeReport/STOCK_DAY_ALL?response=open_data",
+    ],
+    TWSE_REVENUE_URL: [
+        TWSE_REVENUE_URL,
+        "https://www.twse.com.tw/rwd/zh/opendata/t187ap15_L?response=open_data",
+        "https://mopsfin.twse.com.tw/opendata/t187ap15_L.csv",
+    ],
 }
 
 
@@ -120,19 +147,63 @@ def find_col(df: pd.DataFrame, candidates: Iterable[str]) -> Optional[str]:
     return None
 
 
+def _records_from_json_or_csv(text: str, url: str) -> list:
+    """把 API 回傳內容轉成 list[dict]；可處理 JSON 與 open_data CSV。"""
+    if not text or not text.strip():
+        raise ValueError("官方 API 回傳空內容")
+
+    stripped = text.lstrip("\ufeff\n\r\t ")
+
+    # HTML 通常代表官方站暫時阻擋、維護或回傳錯誤頁。
+    if stripped.startswith("<"):
+        preview = stripped[:80].replace("\n", " ").replace("\r", " ")
+        raise ValueError(f"官方 API 回傳非資料頁面：{preview}")
+
+    # 先嘗試 JSON。
+    try:
+        import json
+
+        data = json.loads(stripped)
+        if isinstance(data, dict):
+            for key in ["data", "result", "tables", "items"]:
+                if key in data and isinstance(data[key], list):
+                    return data[key]
+            return [data]
+        if isinstance(data, list):
+            return data
+    except Exception:
+        pass
+
+    # 再嘗試 CSV / open_data。
+    try:
+        df = pd.read_csv(io.StringIO(text))
+        # 有些 open_data CSV 會多出空欄或說明列，先做基本清理。
+        df = df.dropna(how="all")
+        df.columns = [str(c).strip().replace("\ufeff", "") for c in df.columns]
+        if not df.empty and len(df.columns) >= 2:
+            return df.to_dict("records")
+    except Exception:
+        pass
+
+    preview = stripped[:120].replace("\n", " ").replace("\r", " ")
+    raise ValueError(f"無法辨識的 API 回傳格式：{url}；內容前段：{preview}")
+
+
 def request_json(url: str, timeout: int = 25) -> list:
-    """下載 JSON。如果官方回傳格式臨時變動，丟出清楚錯誤。"""
-    resp = requests.get(url, headers=REQUEST_HEADERS, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict):
-        for key in ["data", "result", "tables", "items"]:
-            if key in data and isinstance(data[key], list):
-                return data[key]
-        return [data]
-    if isinstance(data, list):
-        return data
-    raise ValueError(f"無法辨識的 API 回傳格式：{url}")
+    """下載資料。優先走官方 OpenAPI，失敗時自動嘗試 TWSE 備援 open_data。"""
+    urls = URL_FALLBACKS.get(url, [url])
+    last_error: Optional[Exception] = None
+
+    for candidate in urls:
+        try:
+            resp = requests.get(candidate, headers=REQUEST_HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            return _records_from_json_or_csv(resp.text, candidate)
+        except Exception as exc:
+            last_error = exc
+            time.sleep(0.25)
+
+    raise ValueError(f"全部資料源皆下載失敗，最後錯誤：{last_error}")
 
 
 def first_notna(*vals: object) -> object:
