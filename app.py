@@ -25,7 +25,7 @@ from __future__ import annotations
 import io
 import math
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -53,6 +53,9 @@ TPEX_PE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysi
 TPEX_QUOTE_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
 TPEX_REVENUE_URL = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap39_O"
 MARKET_INDEX_TICKER = "^TWII"
+FINMIND_API_URL = "https://api.finmindtrade.com/api/v4/data"
+FINMIND_API_URL_V3 = "https://api.finmindtrade.com/api/v3/data"
+
 
 REQUEST_HEADERS = {
     # 用比較像一般瀏覽器的 UA，降低雲端環境被官方站誤判的機率。
@@ -204,6 +207,277 @@ def request_json(url: str, timeout: int = 25) -> list:
             time.sleep(0.25)
 
     raise ValueError(f"全部資料源皆下載失敗，最後錯誤：{last_error}")
+
+
+
+# ========= FinMind 自動資料源 =========
+
+
+def _date_str(days_ago: int = 0) -> str:
+    return (datetime.today() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+
+
+def _safe_json(resp: requests.Response, label: str) -> dict:
+    """讀取 API JSON；若回傳 HTML 或空白，改成可讀錯誤訊息。"""
+    text = resp.text or ""
+    stripped = text.lstrip("\ufeff\n\r\t ")
+    if not stripped:
+        raise ValueError(f"{label} 回傳空內容")
+    if stripped.startswith("<"):
+        preview = stripped[:100].replace("\n", " ").replace("\r", " ")
+        raise ValueError(f"{label} 回傳 HTML/非 JSON：{preview}")
+    try:
+        return resp.json()
+    except Exception as exc:
+        preview = stripped[:160].replace("\n", " ").replace("\r", " ")
+        raise ValueError(f"{label} JSON 解析失敗：{exc}；內容前段：{preview}")
+
+
+def finmind_request(dataset: str, token: str = "", start_date: str = "", end_date: str = "", data_id: str = "") -> list:
+    """FinMind 資料下載。優先使用 v4；失敗時嘗試 v3 參數。"""
+    token = (token or "").strip()
+    params_v4 = {"dataset": dataset}
+    if data_id:
+        params_v4["data_id"] = data_id
+    if start_date:
+        params_v4["start_date"] = start_date
+    if end_date:
+        params_v4["end_date"] = end_date
+    if token:
+        params_v4["token"] = token
+
+    last_error: Optional[Exception] = None
+    try:
+        resp = requests.get(FINMIND_API_URL, params=params_v4, headers=REQUEST_HEADERS, timeout=35)
+        resp.raise_for_status()
+        data = _safe_json(resp, f"FinMind {dataset}")
+        rows = data.get("data", data if isinstance(data, list) else [])
+        if isinstance(rows, list) and len(rows) > 0:
+            return rows
+        # FinMind 有時候成功但 data 為空，也讓 v3 嘗試一次。
+        last_error = ValueError(f"FinMind v4 {dataset} 無資料")
+    except Exception as exc:
+        last_error = exc
+
+    # v3 fallback。部分舊文件使用 stock_id/date 參數。
+    params_v3 = {"dataset": dataset}
+    if data_id:
+        params_v3["stock_id"] = data_id
+    if start_date:
+        params_v3["date"] = start_date
+    if token:
+        params_v3["token"] = token
+    try:
+        resp = requests.get(FINMIND_API_URL_V3, params=params_v3, headers=REQUEST_HEADERS, timeout=35)
+        resp.raise_for_status()
+        data = _safe_json(resp, f"FinMind v3 {dataset}")
+        rows = data.get("data", data if isinstance(data, list) else [])
+        if isinstance(rows, list):
+            return rows
+    except Exception as exc:
+        last_error = exc
+
+    raise ValueError(f"FinMind {dataset} 下載失敗：{last_error}")
+
+
+def map_finmind_market(x: object) -> str:
+    s = str(x).strip().lower()
+    if any(k in s for k in ["上市", "twse", "tse", "sii", "listed", "exchange"]):
+        return "上市"
+    if any(k in s for k in ["上櫃", "tpex", "otc", "gre tai", "gtsm"]):
+        return "上櫃"
+    return ""
+
+
+def normalize_finmind_info(raw: list) -> pd.DataFrame:
+    df = pd.DataFrame(raw)
+    if df.empty:
+        return pd.DataFrame(columns=["代號", "名稱", "產業別", "市場"])
+    code_col = find_col(df, ["stock_id", "股票代號", "代號", "code"])
+    name_col = find_col(df, ["stock_name", "股票名稱", "公司名稱", "名稱", "name"])
+    industry_col = find_col(df, ["industry_category", "industry", "產業別", "產業類別"])
+    market_col = find_col(df, ["type", "market", "exchange", "市場", "上市櫃", "listing"])
+    out = pd.DataFrame()
+    out["代號"] = df[code_col].map(clean_code) if code_col else ""
+    out["名稱"] = df[name_col].astype(str).str.strip() if name_col else ""
+    out["產業別"] = df[industry_col].astype(str).str.strip() if industry_col else ""
+    out["市場"] = df[market_col].map(map_finmind_market) if market_col else ""
+    out = out[out["代號"].str.len().between(4, 6)]
+    # 僅保留一般股票代號，排除 ETF/權證雜訊可由 type/名稱輔助；缺欄時至少保留代號格式。
+    if "名稱" in out.columns:
+        out = out[~out["名稱"].astype(str).str.contains("購|售|牛|熊|權證|認購|認售", na=False)]
+    return out.drop_duplicates(subset=["代號"], keep="last")
+
+
+def normalize_finmind_per(raw: list, info_df: pd.DataFrame) -> pd.DataFrame:
+    df = pd.DataFrame(raw)
+    if df.empty:
+        return pd.DataFrame()
+    code_col = find_col(df, ["stock_id", "股票代號", "代號", "code"])
+    date_col = find_col(df, ["date", "日期", "資料日期"])
+    pe_col = find_col(df, ["PER", "pe", "本益比", "PEratio"])
+    pb_col = find_col(df, ["PBR", "pb", "股價淨值比", "PBratio"])
+    div_col = find_col(df, ["dividend_yield", "DividendYield", "殖利率", "殖利率%"])
+    out = pd.DataFrame()
+    out["代號"] = df[code_col].map(clean_code) if code_col else ""
+    out["估值資料日期"] = df[date_col].astype(str) if date_col else ""
+    out["本益比"] = df[pe_col].map(to_number) if pe_col else np.nan
+    out["股價淨值比"] = df[pb_col].map(to_number) if pb_col else np.nan
+    out["殖利率%"] = df[div_col].map(to_number) if div_col else np.nan
+    out = out[out["代號"].str.len().between(4, 6)]
+    if "估值資料日期" in out.columns:
+        out = out.sort_values(["代號", "估值資料日期"], ascending=[True, False])
+    out = out.drop_duplicates(subset=["代號"], keep="first")
+    if info_df is not None and not info_df.empty:
+        out = out.merge(info_df[["代號", "名稱", "產業別", "市場"]], on="代號", how="left")
+    else:
+        out["名稱"] = ""
+        out["產業別"] = ""
+        out["市場"] = ""
+    out = out[out["市場"].isin(["上市", "上櫃"])]
+    out["yfinance代號"] = out["代號"] + np.where(out["市場"].eq("上市"), ".TW", ".TWO")
+    out["資料源"] = "FinMind"
+    return out
+
+
+def normalize_finmind_price(raw: list) -> pd.DataFrame:
+    df = pd.DataFrame(raw)
+    if df.empty:
+        return pd.DataFrame(columns=["代號", "收盤價", "今日成交量張"])
+    code_col = find_col(df, ["stock_id", "股票代號", "代號", "code"])
+    date_col = find_col(df, ["date", "日期"])
+    close_col = find_col(df, ["close", "Close", "收盤價", "收盤"])
+    vol_col = find_col(df, ["Trading_Volume", "Trading_Volume", "TradingVolume", "volume", "成交股數", "成交量"])
+    out = pd.DataFrame()
+    out["代號"] = df[code_col].map(clean_code) if code_col else ""
+    out["行情日期"] = df[date_col].astype(str) if date_col else ""
+    out["收盤價"] = df[close_col].map(to_number) if close_col else np.nan
+    vol = df[vol_col].map(to_number) if vol_col else np.nan
+    # FinMind TaiwanStockPrice 的 Trading_Volume 通常為股數；若數值已是張數，除以1000會偏小，但仍只作輔助排序。
+    out["今日成交量張"] = vol / 1000 if vol_col else np.nan
+    out = out[out["代號"].str.len().between(4, 6)]
+    if "行情日期" in out.columns:
+        out = out.sort_values(["代號", "行情日期"], ascending=[True, False])
+    return out.drop_duplicates(subset=["代號"], keep="first")
+
+
+def normalize_finmind_revenue(raw: list) -> pd.DataFrame:
+    df = pd.DataFrame(raw)
+    if df.empty:
+        return pd.DataFrame(columns=["代號"])
+    code_col = find_col(df, ["stock_id", "股票代號", "公司代號", "代號", "code"])
+    date_col = find_col(df, ["date", "資料年月", "營收年月", "出表日期"])
+    rev_col = find_col(df, ["revenue", "月營收", "本月營收", "當月營收", "營業收入-當月營收"])
+    last_year_col = find_col(df, ["last_year_revenue", "去年同月營收", "去年當月營收", "營業收入-去年當月營收"])
+    yoy_col = find_col(df, ["revenue_growth_rate", "YoY", "yoy", "月營收YoY%", "去年同月增減(%)", "營業收入-去年同月增減(%)"])
+    acc_col = find_col(df, ["cumulative_revenue", "累計營收", "當月累計營收", "累計營業收入-當月累計營收"])
+    acc_yoy_col = find_col(df, ["cumulative_revenue_growth_rate", "累計營收YoY%", "累計營收年增率", "累計營業收入-前期比較增減(%)"])
+    year_col = find_col(df, ["revenue_year", "資料年度", "年度", "year"])
+    month_col = find_col(df, ["revenue_month", "資料月份", "月份", "month"])
+    out = pd.DataFrame()
+    out["代號"] = df[code_col].map(clean_code) if code_col else ""
+    out["營收資料日期"] = df[date_col].astype(str) if date_col else ""
+    out["營收年度"] = df[year_col].map(to_number) if year_col else np.nan
+    out["營收月份"] = df[month_col].map(to_number) if month_col else np.nan
+    out["月營收"] = df[rev_col].map(to_number) if rev_col else np.nan
+    out["去年同月營收"] = df[last_year_col].map(to_number) if last_year_col else np.nan
+    out["月營收YoY%"] = df[yoy_col].map(sane_percent) if yoy_col else np.nan
+    out["累計營收"] = df[acc_col].map(to_number) if acc_col else np.nan
+    out["累計營收YoY%"] = df[acc_yoy_col].map(sane_percent) if acc_yoy_col else np.nan
+    need_yoy = out["月營收YoY%"].isna() & out["月營收"].notna() & out["去年同月營收"].notna() & (out["去年同月營收"] != 0)
+    out.loc[need_yoy, "月營收YoY%"] = (out.loc[need_yoy, "月營收"] / out.loc[need_yoy, "去年同月營收"] - 1) * 100
+    out = out[out["代號"].str.len().between(4, 6)]
+    if "營收資料日期" in out.columns:
+        out = out.sort_values(["代號", "營收資料日期"], ascending=[True, False])
+    elif out[["營收年度", "營收月份"]].notna().any().any():
+        out = out.sort_values(["代號", "營收年度", "營收月份"], ascending=[True, False, False])
+    return out.drop_duplicates(subset=["代號"], keep="first")
+
+
+def compute_industry_relative_columns(base: pd.DataFrame) -> pd.DataFrame:
+    if base.empty:
+        return base
+    if "產業別" in base.columns and base["產業別"].astype(str).str.len().gt(0).any():
+        base["產業平均本益比"] = base.groupby(["市場", "產業別"])["本益比"].transform(lambda s: s.replace([np.inf, -np.inf], np.nan).dropna().mean())
+        base["產業平均P/B"] = base.groupby(["市場", "產業別"])["股價淨值比"].transform(lambda s: s.replace([np.inf, -np.inf], np.nan).dropna().mean())
+        base["相對產業本益比%"] = base["本益比"] / base["產業平均本益比"] * 100
+        base["相對產業P/B%"] = base["股價淨值比"] / base["產業平均P/B"] * 100
+    else:
+        base["產業平均本益比"] = np.nan
+        base["產業平均P/B"] = np.nan
+        base["相對產業本益比%"] = np.nan
+        base["相對產業P/B%"] = np.nan
+    return base
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def load_finmind_data(include_twse: bool, include_tpex: bool, include_revenue: bool, token: str = "") -> pd.DataFrame:
+    """用 FinMind 作為主要資料源，避免 TWSE 在 Streamlit Cloud 回傳 HTML 的問題。"""
+    errors = []
+    end = _date_str(0)
+    per_start = _date_str(45)
+    price_start = _date_str(14)
+    revenue_start = _date_str(430)
+
+    try:
+        info_raw = finmind_request("TaiwanStockInfo", token=token)
+        info_df = normalize_finmind_info(info_raw)
+    except Exception as exc:
+        info_df = pd.DataFrame()
+        errors.append(f"FinMind 股票基本資料下載失敗：{exc}")
+
+    try:
+        per_raw = finmind_request("TaiwanStockPER", token=token, start_date=per_start, end_date=end)
+        base = normalize_finmind_per(per_raw, info_df)
+    except Exception as exc:
+        errors.append(f"FinMind 本益比/PBR/殖利率資料下載失敗：{exc}")
+        base = pd.DataFrame()
+
+    if base.empty:
+        for msg in errors:
+            st.warning(msg)
+        return pd.DataFrame()
+
+    wanted_markets = []
+    if include_twse:
+        wanted_markets.append("上市")
+    if include_tpex:
+        wanted_markets.append("上櫃")
+    base = base[base["市場"].isin(wanted_markets)].copy()
+
+    try:
+        price_raw = finmind_request("TaiwanStockPrice", token=token, start_date=price_start, end_date=end)
+        price_df = normalize_finmind_price(price_raw)
+        if not price_df.empty:
+            base = base.merge(price_df, on="代號", how="left")
+    except Exception as exc:
+        errors.append(f"FinMind 日行情資料下載失敗：{exc}")
+
+    if "收盤價" not in base.columns:
+        base["收盤價"] = np.nan
+    if "今日成交量張" not in base.columns:
+        base["今日成交量張"] = np.nan
+
+    if include_revenue:
+        try:
+            revenue_raw = finmind_request("TaiwanStockMonthRevenue", token=token, start_date=revenue_start, end_date=end)
+            revenue_df = normalize_finmind_revenue(revenue_raw)
+            if not revenue_df.empty:
+                base = base.merge(revenue_df, on="代號", how="left")
+        except Exception as exc:
+            errors.append(f"FinMind 月營收資料下載失敗：{exc}")
+
+    for col in ["產業別", "營收年度", "營收月份", "月營收", "月營收MoM%", "月營收YoY%", "累計營收YoY%"]:
+        if col not in base.columns:
+            base[col] = np.nan if col != "產業別" else ""
+
+    base = base.dropna(subset=["本益比"])
+    base = base[base["本益比"] > 0]
+    base = compute_industry_relative_columns(base)
+
+    for msg in errors:
+        st.warning(msg)
+    return base.reset_index(drop=True)
 
 
 def first_notna(*vals: object) -> object:
@@ -1325,7 +1599,25 @@ with st.sidebar:
     include_twse = "上市" in market_option
     include_tpex = "上櫃" in market_option
 
-    with st.expander("上市資料備援上傳（TWSE 雲端下載失敗時使用）", expanded=False):
+    st.subheader("資料源設定")
+    data_source_mode = st.selectbox(
+        "資料源模式",
+        ["FinMind優先（建議）", "只用FinMind", "官方API優先", "只用官方API"],
+        index=0,
+        help="TWSE 官方 API 在 Streamlit Cloud 有時會回傳 HTML；建議使用 FinMind 優先模式。",
+    )
+    try:
+        default_finmind_token = st.secrets.get("FINMIND_TOKEN", "")
+    except Exception:
+        default_finmind_token = ""
+    finmind_token = st.text_input(
+        "FinMind API Token，可留空",
+        value=default_finmind_token,
+        type="password",
+        help="留空也可嘗試免費額度；若掃描較多或遇到限制，建議到 FinMind 申請 token 後填入。也可在 Streamlit secrets 設定 FINMIND_TOKEN。",
+    )
+
+    with st.expander("上市資料備援上傳（TWSE/FinMind 都失敗時使用）", expanded=False):
         st.caption("如果 Streamlit Cloud 抓不到證交所上市資料，可以先從瀏覽器下載官方 JSON/CSV，再在這裡上傳。至少需要『上市估值資料』；行情與月營收可選。")
         uploaded_twse_pe = st.file_uploader("上市估值資料 BWIBBU_ALL，JSON/CSV", type=["json", "csv", "txt"], key="twse_pe_upload")
         uploaded_twse_quote = st.file_uploader("上市行情資料 STOCK_DAY_ALL，JSON/CSV，可留空", type=["json", "csv", "txt"], key="twse_quote_upload")
@@ -1481,8 +1773,26 @@ if run:
         else:
             st.info(msg)
 
-    with st.spinner("下載官方估值、行情與月營收資料中……"):
-        base = load_official_data(include_twse, include_tpex, include_revenue=use_revenue_filter)
+    with st.spinner("下載估值、行情與月營收資料中……"):
+        base = pd.DataFrame()
+        finmind_first = data_source_mode in ["FinMind優先（建議）", "只用FinMind"]
+        official_allowed = data_source_mode in ["FinMind優先（建議）", "官方API優先", "只用官方API"]
+        finmind_allowed = data_source_mode in ["FinMind優先（建議）", "官方API優先", "只用FinMind"]
+
+        if finmind_first and finmind_allowed:
+            base = load_finmind_data(include_twse, include_tpex, include_revenue=use_revenue_filter, token=finmind_token)
+            if not base.empty:
+                st.success(f"已使用 FinMind 自動資料源取得資料：{len(base):,} 筆")
+
+        if base.empty and official_allowed:
+            base = load_official_data(include_twse, include_tpex, include_revenue=use_revenue_filter)
+            if not base.empty:
+                st.info(f"已使用官方 API 資料源取得資料：{len(base):,} 筆")
+
+        if base.empty and (not finmind_first) and finmind_allowed:
+            base = load_finmind_data(include_twse, include_tpex, include_revenue=use_revenue_filter, token=finmind_token)
+            if not base.empty:
+                st.success(f"官方 API 失敗後，已改用 FinMind 取得資料：{len(base):,} 筆")
 
     uploaded_twse_base = build_uploaded_twse_data(
         uploaded_twse_pe,
@@ -1501,7 +1811,7 @@ if run:
         st.success(f"已套用上傳的上市備援資料：{len(uploaded_twse_base):,} 筆")
 
     if base.empty:
-        st.error("沒有取得官方資料。可能是 API 暫時無法連線，或回傳格式有變。若上市資料在 Streamlit Cloud 持續失敗，請使用左側的『上市資料備援上傳』。")
+        st.error("沒有取得資料。可能是 FinMind / 官方 API 暫時無法連線、API 額度受限，或回傳格式有變。可以先填入 FinMind token、改成「官方API優先」，或使用左側的備援上傳。")
         st.stop()
 
     # 手動股票代號模式先套用，避免全市場過濾後找不到自選股。
