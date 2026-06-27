@@ -329,6 +329,65 @@ def normalize_revenue_table(raw: list, market: str) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def load_uploaded_records(uploaded_file, label: str) -> list:
+    """讀取使用者上傳的 TWSE JSON / CSV 備援資料。"""
+    if uploaded_file is None:
+        return []
+    raw = uploaded_file.getvalue()
+    text = raw.decode("utf-8-sig", errors="replace")
+    return _records_from_json_or_csv(text, label)
+
+
+def assemble_market_table(pe_df: pd.DataFrame, quote_df: pd.DataFrame, revenue_df: pd.DataFrame) -> pd.DataFrame:
+    """把估值、行情、月營收三份表合併成主資料表。"""
+    if pe_df is None or pe_df.empty:
+        return pd.DataFrame()
+
+    base = pe_df.copy()
+    if quote_df is not None and not quote_df.empty:
+        base = base.merge(quote_df, on=["代號", "市場"], how="left")
+    else:
+        if "收盤價" not in base.columns:
+            base["收盤價"] = np.nan
+        if "今日成交量張" not in base.columns:
+            base["今日成交量張"] = np.nan
+
+    if revenue_df is not None and not revenue_df.empty:
+        base = base.merge(revenue_df, on=["代號", "市場"], how="left")
+        if "名稱_營收" in base.columns:
+            base["名稱"] = base["名稱"].where(base["名稱"].astype(str).str.len() > 0, base.get("名稱_營收", ""))
+    else:
+        for col in ["產業別", "月營收YoY%", "累計營收YoY%"]:
+            if col not in base.columns:
+                base[col] = np.nan if col.endswith("%") else ""
+
+    return base
+
+
+def build_uploaded_twse_data(pe_upload, quote_upload, revenue_upload, include_revenue: bool) -> pd.DataFrame:
+    """建立使用者上傳的上市備援資料表。至少需要上市估值資料。"""
+    try:
+        pe_raw = load_uploaded_records(pe_upload, "上傳上市估值資料")
+        if not pe_raw:
+            return pd.DataFrame()
+        pe_df = normalize_pe_table(pe_raw, "上市")
+
+        quote_df = pd.DataFrame()
+        if quote_upload is not None:
+            quote_raw = load_uploaded_records(quote_upload, "上傳上市行情資料")
+            quote_df = normalize_quote_table(quote_raw, "上市")
+
+        revenue_df = pd.DataFrame()
+        if include_revenue and revenue_upload is not None:
+            revenue_raw = load_uploaded_records(revenue_upload, "上傳上市月營收資料")
+            revenue_df = normalize_revenue_table(revenue_raw, "上市")
+
+        return assemble_market_table(pe_df, quote_df, revenue_df)
+    except Exception as exc:
+        st.warning(f"上市備援上傳資料讀取失敗：{exc}")
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def load_official_data(include_twse: bool, include_tpex: bool, include_revenue: bool) -> pd.DataFrame:
     """下載官方估值、行情、月營收資料。快取 30 分鐘。"""
@@ -1266,6 +1325,18 @@ with st.sidebar:
     include_twse = "上市" in market_option
     include_tpex = "上櫃" in market_option
 
+    with st.expander("上市資料備援上傳（TWSE 雲端下載失敗時使用）", expanded=False):
+        st.caption("如果 Streamlit Cloud 抓不到證交所上市資料，可以先從瀏覽器下載官方 JSON/CSV，再在這裡上傳。至少需要『上市估值資料』；行情與月營收可選。")
+        uploaded_twse_pe = st.file_uploader("上市估值資料 BWIBBU_ALL，JSON/CSV", type=["json", "csv", "txt"], key="twse_pe_upload")
+        uploaded_twse_quote = st.file_uploader("上市行情資料 STOCK_DAY_ALL，JSON/CSV，可留空", type=["json", "csv", "txt"], key="twse_quote_upload")
+        uploaded_twse_revenue = st.file_uploader("上市月營收資料 t187ap15_L，JSON/CSV，可留空", type=["json", "csv", "txt"], key="twse_revenue_upload")
+        st.markdown(
+            "資料網址：  \n"
+            "1. 估值：https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL  \n"
+            "2. 行情：https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL  \n"
+            "3. 月營收：https://openapi.twse.com.tw/v1/opendata/t187ap15_L"
+        )
+
     st.subheader("估值濾網")
     pe_max = st.number_input("本益比上限", min_value=1.0, max_value=100.0, value=20.0, step=1.0)
     min_price = st.number_input("最低股價", min_value=0.0, max_value=1000.0, value=10.0, step=1.0)
@@ -1413,8 +1484,24 @@ if run:
     with st.spinner("下載官方估值、行情與月營收資料中……"):
         base = load_official_data(include_twse, include_tpex, include_revenue=use_revenue_filter)
 
+    uploaded_twse_base = build_uploaded_twse_data(
+        uploaded_twse_pe,
+        uploaded_twse_quote,
+        uploaded_twse_revenue,
+        include_revenue=use_revenue_filter,
+    )
+    if not uploaded_twse_base.empty:
+        if base.empty:
+            base = uploaded_twse_base.copy()
+        else:
+            # 若官方上市資料也有部分成功，以上傳資料覆蓋同代號上市資料。
+            uploaded_codes = set(uploaded_twse_base["代號"].astype(str))
+            base = base[~((base["市場"] == "上市") & (base["代號"].astype(str).isin(uploaded_codes)))]
+            base = pd.concat([base, uploaded_twse_base], ignore_index=True)
+        st.success(f"已套用上傳的上市備援資料：{len(uploaded_twse_base):,} 筆")
+
     if base.empty:
-        st.error("沒有取得官方資料。可能是 API 暫時無法連線，或回傳格式有變。")
+        st.error("沒有取得官方資料。可能是 API 暫時無法連線，或回傳格式有變。若上市資料在 Streamlit Cloud 持續失敗，請使用左側的『上市資料備援上傳』。")
         st.stop()
 
     # 手動股票代號模式先套用，避免全市場過濾後找不到自選股。
