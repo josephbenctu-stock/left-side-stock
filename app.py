@@ -394,6 +394,106 @@ def normalize_finmind_revenue(raw: list) -> pd.DataFrame:
     return out.drop_duplicates(subset=["代號"], keep="first")
 
 
+
+# ========= Yahoo 批次估值備援 =========
+
+YAHOO_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
+
+
+def chunked(seq: List[str], size: int = 80) -> Iterable[List[str]]:
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _yahoo_percent(val: object) -> float:
+    """Yahoo 有時用 0.03 表示 3%，有時用 3 表示 3%，統一轉成百分比。"""
+    v = to_number(val)
+    if pd.isna(v):
+        return np.nan
+    if abs(v) <= 1:
+        return v * 100
+    return v
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def load_yahoo_valuation_fallback(info_records: Tuple[Tuple[str, str, str, str], ...], include_twse: bool, include_tpex: bool) -> pd.DataFrame:
+    """當 FinMind / TWSE 無法提供全市場估值時，用 Yahoo Finance quote 批次補 PE/PB/殖利率。
+
+    info_records: (代號, 名稱, 產業別, 市場)
+    這不是交易所官方資料，但可避免 Streamlit Cloud 被 TWSE 擋住時整個 App 無資料。
+    """
+    rows = []
+    info = pd.DataFrame(info_records, columns=["代號", "名稱", "產業別", "市場"])
+    if info.empty:
+        return pd.DataFrame()
+    wanted = []
+    if include_twse:
+        wanted.append("上市")
+    if include_tpex:
+        wanted.append("上櫃")
+    info = info[info["市場"].isin(wanted)].copy()
+    info = info[info["代號"].astype(str).str.len().between(4, 6)]
+    info = info.drop_duplicates(subset=["代號", "市場"], keep="last")
+    if info.empty:
+        return pd.DataFrame()
+
+    symbol_to_meta = {}
+    symbols = []
+    for _, r in info.iterrows():
+        suffix = ".TW" if r["市場"] == "上市" else ".TWO"
+        sym = f"{r['代號']}{suffix}"
+        symbols.append(sym)
+        symbol_to_meta[sym] = r
+
+    for part in chunked(symbols, 80):
+        try:
+            resp = requests.get(
+                YAHOO_QUOTE_URL,
+                params={"symbols": ",".join(part), "lang": "zh-TW", "region": "TW"},
+                headers=REQUEST_HEADERS,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = _safe_json(resp, "Yahoo quote")
+            results = data.get("quoteResponse", {}).get("result", []) if isinstance(data, dict) else []
+        except Exception:
+            results = []
+        for item in results:
+            sym = item.get("symbol", "")
+            meta = symbol_to_meta.get(sym)
+            if meta is None:
+                continue
+            pe = first_notna(item.get("trailingPE"), item.get("forwardPE"))
+            pb = first_notna(item.get("priceToBook"), item.get("bookValue"))
+            # bookValue 不是 P/B，若沒有 priceToBook，不用 bookValue 代替。
+            pb = item.get("priceToBook", np.nan)
+            dy = first_notna(item.get("trailingAnnualDividendYield"), item.get("dividendYield"))
+            rows.append({
+                "代號": meta["代號"],
+                "名稱": first_notna(item.get("shortName"), item.get("longName"), meta["名稱"]),
+                "產業別": meta["產業別"],
+                "市場": meta["市場"],
+                "估值資料日期": _date_str(0),
+                "本益比": to_number(pe),
+                "股價淨值比": to_number(pb),
+                "殖利率%": _yahoo_percent(dy),
+                "收盤價": to_number(first_notna(item.get("regularMarketPrice"), item.get("postMarketPrice"), item.get("preMarketPrice"))),
+                "今日成交量張": to_number(item.get("regularMarketVolume")) / 1000,
+                "yfinance代號": sym,
+                "資料源": "Yahoo備援",
+            })
+        time.sleep(0.1)
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame()
+    out = out.dropna(subset=["本益比"])
+    out = out[out["本益比"] > 0]
+    for col in ["營收年度", "營收月份", "月營收", "月營收MoM%", "月營收YoY%", "累計營收YoY%"]:
+        if col not in out.columns:
+            out[col] = np.nan
+    return compute_industry_relative_columns(out).reset_index(drop=True)
+
 def compute_industry_relative_columns(base: pd.DataFrame) -> pd.DataFrame:
     if base.empty:
         return base
@@ -432,6 +532,18 @@ def load_finmind_data(include_twse: bool, include_tpex: bool, include_revenue: b
     except Exception as exc:
         errors.append(f"FinMind 本益比/PBR/殖利率資料下載失敗：{exc}")
         base = pd.DataFrame()
+
+    # TaiwanStockPER 在部分情況下不能全市場直接下載，或會要求個股 stock_id。
+    # 若 FinMind 全市場估值失敗，改用 Yahoo Finance 批次 quote 作估值備援，避免 App 完全沒有資料。
+    if base.empty and info_df is not None and not info_df.empty:
+        try:
+            info_records = tuple(info_df[["代號", "名稱", "產業別", "市場"]].fillna("").astype(str).itertuples(index=False, name=None))
+            base = load_yahoo_valuation_fallback(info_records, include_twse, include_tpex)
+            if not base.empty:
+                errors.append("已改用 Yahoo 批次估值備援；本益比/PBR/殖利率非交易所官方資料，請作為篩選輔助。")
+        except Exception as exc:
+            errors.append(f"Yahoo 批次估值備援失敗：{exc}")
+            base = pd.DataFrame()
 
     if base.empty:
         for msg in errors:
