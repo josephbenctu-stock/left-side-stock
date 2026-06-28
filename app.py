@@ -41,7 +41,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ========= 基本設定 =========
 
 st.set_page_config(
-    page_title="左側低估值選股器 Pro Max｜逐檔PER版",
+    page_title="左側低估值選股器 Pro Max｜全市場分層版",
     page_icon="📉",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -754,6 +754,202 @@ def load_finmind_per_stock_mode(include_twse: bool, include_tpex: bool, include_
     st.info(f"目前使用 FinMind 逐檔 PER 模式：已掃描 {len(scan_df)} 檔，取得 {len(base)} 檔估值資料。速度較慢，但通常比 Yahoo 逐檔備援覆蓋更完整。")
     return base.reset_index(drop=True)
 
+
+
+
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def load_stock_universe_records(include_twse: bool, include_tpex: bool, token: str = "") -> Tuple[Tuple[str, str, str, str], ...]:
+    """取得上市櫃股票池。優先用 FinMind 股票清單；失敗時退回內建常用股票池。
+
+    回傳 tuple 是為了讓 Streamlit cache 穩定。
+    """
+    try:
+        info_raw = finmind_request("TaiwanStockInfo", token=token)
+        info_df = normalize_finmind_info(info_raw)
+        if info_df.empty:
+            raise ValueError("FinMind 股票清單為空")
+    except Exception:
+        info_df = builtin_taiwan_universe()
+
+    wanted = []
+    if include_twse:
+        wanted.append("上市")
+    if include_tpex:
+        wanted.append("上櫃")
+    info_df = info_df[info_df["市場"].isin(wanted)].copy()
+    info_df = info_df[info_df["代號"].astype(str).str.len().between(4, 6)]
+    info_df = info_df.drop_duplicates(subset=["代號", "市場"], keep="last")
+
+    # 排除常見非普通股雜訊。這裡不硬刪 KY，因為 KY 公司仍可能是可交易普通股。
+    if "名稱" in info_df.columns:
+        info_df = info_df[~info_df["名稱"].astype(str).str.contains("ETF|ETN|指數|債|權證|購|售|牛|熊|認購|認售|特別股", case=False, na=False)]
+
+    # 先把內建常用股排前面，再接全市場其他股票；這樣掃部分檔數時不會全部落在冷門股。
+    priority = builtin_taiwan_universe()[["代號"]].drop_duplicates().copy()
+    priority["_priority"] = range(len(priority))
+    info_df = info_df.merge(priority, on="代號", how="left")
+    info_df["_priority"] = info_df["_priority"].fillna(999999)
+    info_df = info_df.sort_values(["_priority", "代號"]).drop(columns=["_priority"])
+    return tuple(info_df[["代號", "名稱", "產業別", "市場"]].fillna("").astype(str).itertuples(index=False, name=None))
+
+
+def universe_records_to_df(records: Tuple[Tuple[str, str, str, str], ...]) -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame(columns=["代號", "名稱", "產業別", "市場", "yfinance代號"])
+    df = pd.DataFrame(records, columns=["代號", "名稱", "產業別", "市場"])
+    df["代號"] = df["代號"].map(clean_code)
+    df = df[df["代號"].str.len().between(4, 6)].drop_duplicates(subset=["代號", "市場"], keep="last")
+    df["yfinance代號"] = df["代號"] + np.where(df["市場"].eq("上市"), ".TW", ".TWO")
+    return df.reset_index(drop=True)
+
+
+def full_market_coarse_technical_scan(
+    universe_df: pd.DataFrame,
+    params: ScreenParams,
+    history_period: str,
+    universe_limit: int,
+    batch_size: int,
+    coarse_min_tech_score: int,
+) -> pd.DataFrame:
+    """第一階段：用 yfinance K 線對全市場做快速粗篩。
+
+    只做價格、均量、回檔、RSI、支撐、近期是否破低等技術條件；不抓逐檔 PER。
+    通過後才進入第二階段估值深篩。
+    """
+    if universe_df.empty:
+        return pd.DataFrame()
+    scan_df = universe_df.head(max(20, int(universe_limit))).copy()
+    tickers = scan_df["yfinance代號"].dropna().astype(str).unique().tolist()
+    if not tickers:
+        return pd.DataFrame()
+
+    rows = []
+    batch_size = max(20, int(batch_size or 100))
+    batches = list(chunked(tickers, batch_size))
+    progress = st.progress(0, text=f"第一階段 K 線粗篩：0 / {len(tickers)} 檔")
+    done = 0
+    meta_by_ticker = scan_df.set_index("yfinance代號").to_dict("index")
+
+    for b_idx, batch in enumerate(batches, start=1):
+        try:
+            hist = download_history(batch, period=history_period)
+        except Exception:
+            hist = pd.DataFrame()
+        for ticker in batch:
+            meta = meta_by_ticker.get(ticker, {})
+            one = extract_one_symbol(hist, ticker)
+            result = analyze_symbol(one, params)
+            if result is not None:
+                # 粗篩先看技術與基本流動性，不碰估值。
+                if to_number(result.get("收盤價_技術")) < params.min_price:
+                    done += 1
+                    continue
+                if to_number(result.get("技術分數")) >= coarse_min_tech_score:
+                    row = dict(meta)
+                    row.update(result)
+                    row["粗篩技術分數"] = row.get("技術分數", 0)
+                    rows.append(row)
+            done += 1
+        progress.progress(min(done / max(len(tickers), 1), 1.0), text=f"第一階段 K 線粗篩：{done} / {len(tickers)} 檔，通過 {len(rows)} 檔")
+    progress.empty()
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return pd.DataFrame()
+    return out.sort_values(["粗篩技術分數", "20日均量張", "RSI14"], ascending=[False, False, True], na_position="last").reset_index(drop=True)
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def load_finmind_per_for_codes(meta_records: Tuple[Tuple[str, str, str, str], ...], token: str = "", include_revenue: bool = False) -> Tuple[pd.DataFrame, List[str]]:
+    """第二階段：只對粗篩通過的候選股逐檔抓 PER/PBR/殖利率。"""
+    messages: List[str] = []
+    if not meta_records:
+        return pd.DataFrame(), messages
+    meta_df = pd.DataFrame(meta_records, columns=["代號", "名稱", "產業別", "市場"])
+    meta_df["代號"] = meta_df["代號"].map(clean_code)
+    meta_df = meta_df[meta_df["代號"].str.len().between(4, 6)].drop_duplicates(subset=["代號", "市場"], keep="last")
+    rows = []
+    start = _date_str(20)
+    end = _date_str(0)
+    fallback_days = list(range(0, 15))
+
+    for _, meta in meta_df.iterrows():
+        code = str(meta["代號"])
+        per_rows = []
+        try:
+            params_fm = {"dataset": "TaiwanStockPER", "data_id": code, "start_date": start, "end_date": end}
+            if token:
+                params_fm["token"] = token
+            resp = requests.get(FINMIND_API_URL, params=params_fm, headers=REQUEST_HEADERS, timeout=18)
+            resp.raise_for_status()
+            data = _safe_json(resp, f"FinMind TaiwanStockPER {code}")
+            got = data.get("data", []) if isinstance(data, dict) else []
+            if isinstance(got, list) and got:
+                per_rows = got
+        except Exception:
+            per_rows = []
+
+        if not per_rows:
+            for d in fallback_days:
+                try:
+                    params_v3 = {"dataset": "TaiwanStockPER", "stock_id": code, "date": _date_str(d)}
+                    if token:
+                        params_v3["token"] = token
+                    resp = requests.get(FINMIND_API_URL_V3, params=params_v3, headers=REQUEST_HEADERS, timeout=12)
+                    resp.raise_for_status()
+                    data = _safe_json(resp, f"FinMind v3 TaiwanStockPER {code}")
+                    got = data.get("data", []) if isinstance(data, dict) else []
+                    if isinstance(got, list) and got:
+                        per_rows = got
+                        break
+                except Exception:
+                    continue
+
+        if per_rows:
+            tmp = pd.DataFrame(per_rows)
+            date_col = find_col(tmp, ["date", "日期", "資料日期"])
+            pe_col = find_col(tmp, ["PER", "pe", "本益比", "PEratio"])
+            pb_col = find_col(tmp, ["PBR", "pb", "股價淨值比", "PBratio"])
+            div_col = find_col(tmp, ["dividend_yield", "DividendYield", "殖利率", "殖利率%"])
+            if date_col:
+                tmp = tmp.sort_values(date_col, ascending=False)
+            r = tmp.iloc[0]
+            pe = to_number(r.get(pe_col)) if pe_col else np.nan
+            if not pd.isna(pe) and pe > 0:
+                rows.append({
+                    "代號": code,
+                    "名稱": meta.get("名稱", ""),
+                    "產業別": meta.get("產業別", ""),
+                    "市場": meta.get("市場", ""),
+                    "估值資料日期": str(r.get(date_col, _date_str(0))) if date_col else _date_str(0),
+                    "本益比": pe,
+                    "股價淨值比": to_number(r.get(pb_col)) if pb_col else np.nan,
+                    "殖利率%": to_number(r.get(div_col)) if div_col else np.nan,
+                    "收盤價": np.nan,
+                    "今日成交量張": np.nan,
+                    "yfinance代號": f"{code}{'.TW' if meta.get('市場') == '上市' else '.TWO'}",
+                    "資料源": "全市場分層｜FinMind逐檔PER",
+                })
+        time.sleep(0.02)
+
+    base = pd.DataFrame(rows)
+    if base.empty:
+        return pd.DataFrame(), ["粗篩後候選股沒有取得可用本益比資料。可提高深度估值檔數、填入 FinMind token，或改用 Yahoo 穩定模式。"]
+
+    for col in ["營收年度", "營收月份", "月營收", "月營收MoM%", "月營收YoY%", "累計營收YoY%"]:
+        if col not in base.columns:
+            base[col] = np.nan
+
+    if include_revenue:
+        try:
+            revenue_raw = finmind_request("TaiwanStockMonthRevenue", token=token, start_date=_date_str(430), end_date=_date_str(0))
+            revenue_df = normalize_finmind_revenue(revenue_raw)
+            if not revenue_df.empty:
+                base = base.merge(revenue_df, on="代號", how="left", suffixes=("", "_rev"))
+        except Exception as exc:
+            messages.append(f"月營收自動補充失敗，已略過月營收欄位：{exc}")
+
+    base = compute_industry_relative_columns(base).reset_index(drop=True)
+    return base, messages
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
 def load_yahoo_stable_data(include_twse: bool, include_tpex: bool, include_revenue: bool, token: str = "") -> pd.DataFrame:
@@ -2035,8 +2231,8 @@ def mini_backtest(df: pd.DataFrame, params: ScreenParams, hold_days: int = 20, l
 if "watchlist" not in st.session_state:
     st.session_state.watchlist = pd.DataFrame()
 
-st.title("📉 左側低估值選股器 Pro Max")
-st.caption("本益比自訂 + 財報品質 + 大盤燈號 + 產業強弱 + 左側技術 + 部位計算 + 觀察名單狀態追蹤")
+st.title("📉 左側低估值選股器 Pro Max｜全市場分層版")
+st.caption("全市場股票池 + K線粗篩 + 估值深篩 + 左側技術 + 部位計算 + 觀察名單狀態追蹤")
 
 with st.expander("這個 App 的升級邏輯", expanded=False):
     st.markdown(
@@ -2067,9 +2263,17 @@ with st.sidebar:
     st.subheader("資料源設定")
     data_source_mode = st.selectbox(
         "資料源模式",
-        ["FinMind逐檔PER模式（較慢但較完整）", "Yahoo穩定模式（建議）", "FinMind優先", "只用FinMind", "官方API優先", "只用官方API"],
+        [
+            "全市場分層掃描模式（建議）",
+            "FinMind逐檔PER模式（較慢但較完整）",
+            "Yahoo穩定模式（快速測試）",
+            "FinMind優先",
+            "只用FinMind",
+            "官方API優先",
+            "只用官方API",
+        ],
         index=0,
-        help="若 Yahoo 只抓到少量股票，請使用 FinMind逐檔PER模式；若速度太慢再改用 Yahoo穩定模式。",
+        help="建議使用全市場分層掃描：先用K線快速粗篩全市場，再只對候選股抓本益比/PBR。",
     )
     try:
         default_finmind_token = st.secrets.get("FINMIND_TOKEN", "")
@@ -2081,7 +2285,13 @@ with st.sidebar:
         type="password",
         help="留空也可嘗試免費額度；若掃描較多或遇到限制，建議到 FinMind 申請 token 後填入。也可在 Streamlit secrets 設定 FINMIND_TOKEN。",
     )
-    finmind_per_limit = st.slider("FinMind逐檔PER最多估值檔數", 20, 800, 250, step=10, help="逐檔模式會一檔一檔抓本益比/PBR/殖利率。數字越大越完整，但速度越慢；沒有 token 建議先用 100～250。")
+    finmind_per_limit = st.slider("FinMind逐檔PER最多估值檔數", 20, 800, 250, step=10, help="舊逐檔模式會從股票池前 N 檔逐檔抓本益比/PBR/殖利率。")
+
+    with st.expander("全市場分層掃描設定", expanded=True):
+        full_universe_limit = st.slider("第一階段最多粗掃股票數", 100, 2200, 1900, step=50, help="用K線與均量先粗掃。1900約等於上市櫃全市場，但第一次會較慢；之後快取會快很多。")
+        coarse_batch_size = st.slider("K線粗掃每批檔數", 30, 250, 100, step=10, help="每批太大可能不穩，太小會較慢；手機建議 80～120。")
+        coarse_min_tech_score = st.slider("第一階段最低技術粗篩分", 0, 60, 20, step=5, help="越高越嚴格，進入估值深篩的股票越少。")
+        deep_valuation_limit = st.slider("第二階段最多估值深篩檔數", 30, 800, 300, step=10, help="只對第一階段通過且排序靠前的候選股抓本益比/PBR/殖利率。")
 
     with st.expander("上市資料備援上傳（TWSE/FinMind 都失敗時使用）", expanded=False):
         st.caption("如果 Streamlit Cloud 抓不到證交所上市資料，可以先從瀏覽器下載官方 JSON/CSV，再在這裡上傳。至少需要『上市估值資料』；行情與月營收可選。")
@@ -2242,11 +2452,42 @@ if run:
     with st.spinner("下載估值、行情與月營收資料中……"):
         base = pd.DataFrame()
 
-        if data_source_mode == "Yahoo穩定模式（建議)":
-            # 兼容意外的全形/半形括號輸入；實際選單使用下面 startswith 判斷。
-            pass
+        if data_source_mode.startswith("全市場分層掃描模式"):
+            universe_records = load_stock_universe_records(include_twse, include_tpex, token=finmind_token)
+            universe_df = universe_records_to_df(universe_records)
+            if manual_codes.strip():
+                manual_set_for_universe = {clean_code(x) for x in manual_codes.replace("\n", ",").split(",") if clean_code(x)}
+                universe_df = universe_df[universe_df["代號"].isin(manual_set_for_universe)]
+            st.info(f"第一階段準備粗掃股票池：{len(universe_df):,} 檔。先用K線與流動性粗篩，不會對全市場逐檔抓本益比。")
+            coarse_df = full_market_coarse_technical_scan(
+                universe_df,
+                params=params,
+                history_period=history_period,
+                universe_limit=full_universe_limit,
+                batch_size=coarse_batch_size,
+                coarse_min_tech_score=coarse_min_tech_score,
+            )
+            if coarse_df.empty:
+                st.warning("第一階段 K 線粗篩後沒有股票。可放寬 RSI、回檔幅度、支撐距離、均量或降低粗篩分數。")
+                st.stop()
+            st.success(f"第一階段完成：粗篩通過 {len(coarse_df):,} 檔。")
 
-        if data_source_mode.startswith("FinMind逐檔PER模式"):
+            deep_df = coarse_df.head(int(deep_valuation_limit)).copy()
+            meta_records = tuple(deep_df[["代號", "名稱", "產業別", "市場"]].fillna("").astype(str).itertuples(index=False, name=None))
+            with st.spinner(f"第二階段估值深篩：對 {len(meta_records):,} 檔候選股抓本益比 / PBR / 殖利率……"):
+                base, per_messages = load_finmind_per_for_codes(meta_records, token=finmind_token, include_revenue=use_revenue_filter)
+            for msg in per_messages:
+                st.warning(msg)
+            if not base.empty:
+                # 把第一階段得到的收盤、均量等資訊帶回估值表，讓後面排序與濾網更準。
+                tech_cols = [c for c in ["代號", "市場", "收盤價_技術", "20日均量張", "粗篩技術分數", "60日回檔%", "RSI14"] if c in deep_df.columns]
+                base = base.merge(deep_df[tech_cols], on=["代號", "市場"], how="left")
+                if "收盤價_技術" in base.columns:
+                    base["收盤價"] = base["收盤價"].fillna(base["收盤價_技術"])
+                if "20日均量張" in base.columns:
+                    base["今日成交量張"] = base["今日成交量張"].fillna(base["20日均量張"])
+                st.success(f"第二階段完成：取得 {len(base):,} 檔估值資料。")
+        elif data_source_mode.startswith("FinMind逐檔PER模式"):
             base = load_finmind_per_stock_mode(
                 include_twse,
                 include_tpex,
@@ -2297,7 +2538,7 @@ if run:
         st.success(f"已套用上傳的上市備援資料：{len(uploaded_twse_base):,} 筆")
 
     if base.empty:
-        st.error("沒有取得資料。請先確認資料源模式選「FinMind逐檔PER模式」或「Yahoo穩定模式」，並把「沒有月營收資料者直接排除」關閉；若仍失敗，可降低最多下載檔數或稍後重試。")
+        st.error("沒有取得資料。請先確認資料源模式選「全市場分層掃描模式」或「FinMind逐檔PER模式」，並把「沒有月營收資料者直接排除」關閉；若仍失敗，可降低最多下載檔數或稍後重試。")
         st.stop()
 
     # 手動股票代號模式先套用，避免全市場過濾後找不到自選股。
