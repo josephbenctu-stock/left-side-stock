@@ -41,7 +41,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ========= 基本設定 =========
 
 st.set_page_config(
-    page_title="左側低估值選股器 Pro Max",
+    page_title="左側低估值選股器 Pro Max｜逐檔PER版",
     page_icon="📉",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -612,6 +612,147 @@ def builtin_taiwan_universe() -> pd.DataFrame:
         if len(parts)>=4:
             rows.append({"代號":parts[0],"名稱":parts[1],"產業別":parts[2],"市場":parts[3]})
     return pd.DataFrame(rows).drop_duplicates(subset=["代號","市場"], keep="last")
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def load_finmind_per_stock_mode(include_twse: bool, include_tpex: bool, include_revenue: bool, token: str = "", limit: int = 300) -> pd.DataFrame:
+    """FinMind 逐檔 PER 模式。
+
+    背景：FinMind 的 TaiwanStockPER 在部分環境無法全市場一次取得；官方範例是以 stock_id + date
+    查詢單檔。本模式先取得股票清單，再逐檔抓 PER/PBR/殖利率，覆蓋率通常會比 Yahoo Ticker.info 高，
+    但速度較慢，適合 Streamlit Cloud 上 TWSE/TPEX 官方 API 不穩時使用。
+    """
+    messages = []
+    try:
+        info_raw = finmind_request("TaiwanStockInfo", token=token)
+        info_df = normalize_finmind_info(info_raw)
+        if info_df.empty:
+            raise ValueError("FinMind 股票清單為空")
+    except Exception as exc:
+        info_df = builtin_taiwan_universe()
+        messages.append(f"FinMind 股票清單失敗，已改用內建常用股票池：{exc}")
+
+    wanted = []
+    if include_twse:
+        wanted.append("上市")
+    if include_tpex:
+        wanted.append("上櫃")
+    info_df = info_df[info_df["市場"].isin(wanted)].copy()
+    info_df = info_df[info_df["代號"].astype(str).str.len().between(4, 6)]
+    info_df = info_df.drop_duplicates(subset=["代號", "市場"], keep="last")
+
+    # 先把內建常用股排在前面，避免只掃前 N 檔時都掃到冷門或資料缺漏股票。
+    priority = builtin_taiwan_universe()[["代號"]].drop_duplicates().copy()
+    priority["_priority"] = range(len(priority))
+    info_df = info_df.merge(priority, on="代號", how="left")
+    info_df["_priority"] = info_df["_priority"].fillna(999999)
+    info_df = info_df.sort_values(["_priority", "代號"]).drop(columns=["_priority"])
+
+    limit = max(20, int(limit or 300))
+    scan_df = info_df.head(limit).copy()
+    if scan_df.empty:
+        for m in messages:
+            st.warning(m)
+        return pd.DataFrame()
+
+    rows = []
+    # 優先用 v4：data_id + start_date/end_date；失敗再用 v3：stock_id + date。
+    start = _date_str(20)
+    end = _date_str(0)
+    fallback_days = list(range(0, 15))
+
+    progress = st.progress(0, text=f"FinMind 逐檔估值下載中：0 / {len(scan_df)}")
+    total = len(scan_df)
+    for idx, (_, meta) in enumerate(scan_df.iterrows(), start=1):
+        code = str(meta["代號"])
+        per_rows = []
+        last_error = None
+        try:
+            params = {"dataset": "TaiwanStockPER", "data_id": code, "start_date": start, "end_date": end}
+            if token:
+                params["token"] = token
+            resp = requests.get(FINMIND_API_URL, params=params, headers=REQUEST_HEADERS, timeout=20)
+            resp.raise_for_status()
+            data = _safe_json(resp, f"FinMind TaiwanStockPER {code}")
+            got = data.get("data", []) if isinstance(data, dict) else []
+            if isinstance(got, list) and got:
+                per_rows = got
+        except Exception as exc:
+            last_error = exc
+
+        if not per_rows:
+            for d in fallback_days:
+                try:
+                    params = {"dataset": "TaiwanStockPER", "stock_id": code, "date": _date_str(d)}
+                    if token:
+                        params["token"] = token
+                    resp = requests.get(FINMIND_API_URL_V3, params=params, headers=REQUEST_HEADERS, timeout=15)
+                    resp.raise_for_status()
+                    data = _safe_json(resp, f"FinMind v3 TaiwanStockPER {code}")
+                    got = data.get("data", []) if isinstance(data, dict) else []
+                    if isinstance(got, list) and got:
+                        per_rows = got
+                        break
+                except Exception as exc:
+                    last_error = exc
+                    continue
+
+        if per_rows:
+            tmp = pd.DataFrame(per_rows)
+            tmp_code_col = find_col(tmp, ["stock_id", "股票代號", "代號", "code"])
+            tmp_date_col = find_col(tmp, ["date", "日期", "資料日期"])
+            tmp_pe_col = find_col(tmp, ["PER", "pe", "本益比", "PEratio"])
+            tmp_pb_col = find_col(tmp, ["PBR", "pb", "股價淨值比", "PBratio"])
+            tmp_div_col = find_col(tmp, ["dividend_yield", "DividendYield", "殖利率", "殖利率%"])
+            if tmp_date_col:
+                tmp = tmp.sort_values(tmp_date_col, ascending=False)
+            r = tmp.iloc[0]
+            pe = to_number(r.get(tmp_pe_col)) if tmp_pe_col else np.nan
+            if not pd.isna(pe) and pe > 0:
+                rows.append({
+                    "代號": code,
+                    "名稱": meta.get("名稱", ""),
+                    "產業別": meta.get("產業別", ""),
+                    "市場": meta.get("市場", ""),
+                    "估值資料日期": str(r.get(tmp_date_col, _date_str(0))) if tmp_date_col else _date_str(0),
+                    "本益比": pe,
+                    "股價淨值比": to_number(r.get(tmp_pb_col)) if tmp_pb_col else np.nan,
+                    "殖利率%": to_number(r.get(tmp_div_col)) if tmp_div_col else np.nan,
+                    "收盤價": np.nan,
+                    "今日成交量張": np.nan,
+                    "yfinance代號": f"{code}{'.TW' if meta.get('市場') == '上市' else '.TWO'}",
+                    "資料源": "FinMind逐檔PER",
+                })
+        if idx % 5 == 0 or idx == total:
+            progress.progress(idx / total, text=f"FinMind 逐檔估值下載中：{idx} / {total}，已取得 {len(rows)} 檔")
+        time.sleep(0.03)
+    progress.empty()
+
+    base = pd.DataFrame(rows)
+    if base.empty:
+        for m in messages:
+            st.warning(m)
+        st.warning("FinMind 逐檔 PER 沒有取得可用估值資料；建議填入 FinMind Token、降低掃描檔數後重試，或改用 Yahoo 穩定模式。")
+        return pd.DataFrame()
+
+    for col in ["營收年度", "營收月份", "月營收", "月營收MoM%", "月營收YoY%", "累計營收YoY%"]:
+        if col not in base.columns:
+            base[col] = np.nan
+
+    if include_revenue:
+        try:
+            revenue_raw = finmind_request("TaiwanStockMonthRevenue", token=token, start_date=_date_str(430), end_date=_date_str(0))
+            revenue_df = normalize_finmind_revenue(revenue_raw)
+            if not revenue_df.empty:
+                base = base.merge(revenue_df, on="代號", how="left", suffixes=("", "_rev"))
+        except Exception as exc:
+            messages.append(f"月營收自動補充失敗，已略過月營收欄位：{exc}")
+
+    base = compute_industry_relative_columns(base).reset_index(drop=True)
+    for m in messages:
+        st.warning(m)
+    st.info(f"目前使用 FinMind 逐檔 PER 模式：已掃描 {len(scan_df)} 檔，取得 {len(base)} 檔估值資料。速度較慢，但通常比 Yahoo 逐檔備援覆蓋更完整。")
+    return base.reset_index(drop=True)
 
 
 @st.cache_data(ttl=60 * 30, show_spinner=False)
@@ -1926,9 +2067,9 @@ with st.sidebar:
     st.subheader("資料源設定")
     data_source_mode = st.selectbox(
         "資料源模式",
-        ["Yahoo穩定模式（建議）", "FinMind優先", "只用FinMind", "官方API優先", "只用官方API"],
+        ["FinMind逐檔PER模式（較慢但較完整）", "Yahoo穩定模式（建議）", "FinMind優先", "只用FinMind", "官方API優先", "只用官方API"],
         index=0,
-        help="若 TWSE/TPEX 或 FinMind 在 Streamlit Cloud 連線不穩，請使用 Yahoo穩定模式。",
+        help="若 Yahoo 只抓到少量股票，請使用 FinMind逐檔PER模式；若速度太慢再改用 Yahoo穩定模式。",
     )
     try:
         default_finmind_token = st.secrets.get("FINMIND_TOKEN", "")
@@ -1940,6 +2081,7 @@ with st.sidebar:
         type="password",
         help="留空也可嘗試免費額度；若掃描較多或遇到限制，建議到 FinMind 申請 token 後填入。也可在 Streamlit secrets 設定 FINMIND_TOKEN。",
     )
+    finmind_per_limit = st.slider("FinMind逐檔PER最多估值檔數", 20, 800, 250, step=10, help="逐檔模式會一檔一檔抓本益比/PBR/殖利率。數字越大越完整，但速度越慢；沒有 token 建議先用 100～250。")
 
     with st.expander("上市資料備援上傳（TWSE/FinMind 都失敗時使用）", expanded=False):
         st.caption("如果 Streamlit Cloud 抓不到證交所上市資料，可以先從瀏覽器下載官方 JSON/CSV，再在這裡上傳。至少需要『上市估值資料』；行情與月營收可選。")
@@ -2104,7 +2246,17 @@ if run:
             # 兼容意外的全形/半形括號輸入；實際選單使用下面 startswith 判斷。
             pass
 
-        if data_source_mode.startswith("Yahoo穩定模式"):
+        if data_source_mode.startswith("FinMind逐檔PER模式"):
+            base = load_finmind_per_stock_mode(
+                include_twse,
+                include_tpex,
+                include_revenue=use_revenue_filter,
+                token=finmind_token,
+                limit=finmind_per_limit,
+            )
+            if not base.empty:
+                st.success(f"已使用 FinMind 逐檔 PER 模式取得資料：{len(base):,} 筆")
+        elif data_source_mode.startswith("Yahoo穩定模式"):
             base = load_yahoo_stable_data(include_twse, include_tpex, include_revenue=use_revenue_filter, token=finmind_token)
             if not base.empty:
                 st.success(f"已使用 Yahoo 穩定模式取得資料：{len(base):,} 筆")
@@ -2145,7 +2297,7 @@ if run:
         st.success(f"已套用上傳的上市備援資料：{len(uploaded_twse_base):,} 筆")
 
     if base.empty:
-        st.error("沒有取得資料。請先確認資料源模式選「Yahoo穩定模式（建議）」，並把「沒有月營收資料者直接排除」關閉；若仍失敗，可降低最多下載檔數或稍後重試。")
+        st.error("沒有取得資料。請先確認資料源模式選「FinMind逐檔PER模式」或「Yahoo穩定模式」，並把「沒有月營收資料者直接排除」關閉；若仍失敗，可降低最多下載檔數或稍後重試。")
         st.stop()
 
     # 手動股票代號模式先套用，避免全市場過濾後找不到自選股。
