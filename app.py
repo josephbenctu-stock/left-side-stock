@@ -34,6 +34,8 @@ import pandas as pd
 import requests
 import streamlit as st
 import yfinance as yf
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 # ========= 基本設定 =========
@@ -199,7 +201,8 @@ def request_json(url: str, timeout: int = 25) -> list:
 
     for candidate in urls:
         try:
-            resp = requests.get(candidate, headers=REQUEST_HEADERS, timeout=timeout)
+            verify_ssl = False if "tpex.org.tw" in candidate else True
+            resp = requests.get(candidate, headers=REQUEST_HEADERS, timeout=timeout, verify=verify_ssl)
             resp.raise_for_status()
             return _records_from_json_or_csv(resp.text, candidate)
         except Exception as exc:
@@ -492,7 +495,216 @@ def load_yahoo_valuation_fallback(info_records: Tuple[Tuple[str, str, str, str],
     for col in ["營收年度", "營收月份", "月營收", "月營收MoM%", "月營收YoY%", "累計營收YoY%"]:
         if col not in out.columns:
             out[col] = np.nan
+
     return compute_industry_relative_columns(out).reset_index(drop=True)
+
+
+def builtin_taiwan_universe() -> pd.DataFrame:
+    """內建常用台股股票池。只有在 FinMind 股票清單抓不到時使用。
+    這不是全市場清單，但可確保 App 不會因外部清單失敗而完全無資料。
+    """
+    raw = """
+2330,台積電,半導體,上市
+2317,鴻海,電子代工,上市
+2454,聯發科,半導體,上市
+2308,台達電,電源,上市
+2412,中華電,電信,上市
+2881,富邦金,金融,上市
+2882,國泰金,金融,上市
+2891,中信金,金融,上市
+2886,兆豐金,金融,上市
+2884,玉山金,金融,上市
+5871,中租-KY,金融租賃,上市
+1301,台塑,塑膠,上市
+1303,南亞,塑膠,上市
+1326,台化,塑膠,上市
+2002,中鋼,鋼鐵,上市
+2303,聯電,半導體,上市
+2327,國巨,被動元件,上市
+2382,廣達,電腦週邊,上市
+2357,華碩,電腦週邊,上市
+2379,瑞昱,半導體,上市
+3711,日月光投控,半導體,上市
+3034,聯詠,半導體,上市
+3008,大立光,光電,上市
+3661,世芯-KY,半導體,上市
+3653,健策,散熱,上市
+3017,奇鋐,散熱,上市
+3324,雙鴻,散熱,上櫃
+5425,台半,半導體,上櫃
+6488,環球晶,半導體,上櫃
+4966,譜瑞-KY,半導體,上櫃
+6223,旺矽,測試介面,上櫃
+6510,精測,測試介面,上櫃
+1560,中砂,半導體材料,上櫃
+3131,弘塑,半導體設備,上櫃
+6187,萬潤,半導體設備,上櫃
+3533,嘉澤,連接器,上市
+6669,緯穎,伺服器,上市
+3231,緯創,電腦週邊,上市
+2356,英業達,電腦週邊,上市
+2324,仁寶,電腦週邊,上市
+2353,宏碁,電腦週邊,上市
+2383,台光電,PCB,上市
+2368,金像電,PCB,上市
+3037,欣興,PCB,上市
+8046,南電,PCB,上市
+3189,景碩,PCB,上市
+2408,南亞科,記憶體,上市
+2344,華邦電,記憶體,上市
+2449,京元電子,半導體測試,上市
+5347,世界,半導體,上櫃
+4743,合一,生技,上櫃
+6472,保瑞,生技,上櫃
+6446,藥華藥,生技,上櫃
+1795,美時,生技,上市
+2603,長榮,航運,上市
+2609,陽明,航運,上市
+2615,萬海,航運,上市
+2618,長榮航,航空,上市
+2610,華航,航空,上市
+1101,台泥,水泥,上市
+1102,亞泥,水泥,上市
+1216,統一,食品,上市
+2912,統一超,貿易百貨,上市
+2207,和泰車,汽車,上市
+9910,豐泰,運動用品,上市
+9914,美利達,自行車,上市
+9921,巨大,自行車,上市
+1402,遠東新,紡織,上市
+2105,正新,橡膠,上市
+1605,華新,電線電纜,上市
+1513,中興電,電機,上市
+1519,華城,電機,上市
+1504,東元,電機,上市
+6806,森崴能源,綠能,上市
+1609,大亞,電線電纜,上市
+2014,中鴻,鋼鐵,上市
+2027,大成鋼,鋼鐵,上市
+5009,榮剛,鋼鐵,上櫃
+6116,彩晶,面板,上市
+2409,友達,面板,上市
+3481,群創,面板,上市
+2345,智邦,網通,上市
+2419,仲琦,網通,上市
+3596,智易,網通,上市
+4904,遠傳,電信,上市
+3045,台灣大,電信,上市
+8454,富邦媒,電商,上市
+8069,元太,光電,上櫃
+8299,群聯,記憶體,上櫃
+3374,精材,半導體,上櫃
+5483,中美晶,半導體,上櫃
+6147,頎邦,封測,上櫃
+3105,穩懋,砷化鎵,上櫃
+8086,宏捷科,砷化鎵,上櫃
+3218,大學光,醫療,上櫃
+4123,晟德,生技,上櫃
+8436,大江,生技,上櫃
+3081,聯亞,光通訊,上櫃
+6274,台燿,PCB,上櫃
+6143,振曜,電子,上櫃
+4979,華星光,光通訊,上櫃
+"""
+    rows=[]
+    for line in raw.strip().splitlines():
+        parts=[x.strip() for x in line.split(',')]
+        if len(parts)>=4:
+            rows.append({"代號":parts[0],"名稱":parts[1],"產業別":parts[2],"市場":parts[3]})
+    return pd.DataFrame(rows).drop_duplicates(subset=["代號","市場"], keep="last")
+
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def load_yahoo_stable_data(include_twse: bool, include_tpex: bool, include_revenue: bool, token: str = "") -> pd.DataFrame:
+    """最穩定模式：避開 TWSE/TPEX 官方 API 與 FinMind PER，使用 FinMind 股票清單 + Yahoo 批次估值。
+    若 FinMind 股票清單失敗，退回內建常用股票池。月營收在此模式預設不強制取得。
+    """
+    messages=[]
+    try:
+        info_raw = finmind_request("TaiwanStockInfo", token=token)
+        info_df = normalize_finmind_info(info_raw)
+        if info_df.empty:
+            raise ValueError("FinMind 股票清單為空")
+    except Exception as exc:
+        info_df = builtin_taiwan_universe()
+        messages.append(f"FinMind 股票清單失敗，已改用內建常用股票池：{exc}")
+
+    wanted=[]
+    if include_twse:
+        wanted.append("上市")
+    if include_tpex:
+        wanted.append("上櫃")
+    info_df = info_df[info_df["市場"].isin(wanted)].copy()
+    info_df = info_df[info_df["代號"].astype(str).str.len().between(4,6)]
+    info_df = info_df.drop_duplicates(subset=["代號","市場"], keep="last")
+    if info_df.empty:
+        for m in messages:
+            st.warning(m)
+        return pd.DataFrame()
+
+    info_records = tuple(info_df[["代號","名稱","產業別","市場"]].fillna("").astype(str).itertuples(index=False, name=None))
+    base = load_yahoo_valuation_fallback(info_records, include_twse, include_tpex)
+    if base.empty:
+        # 最後備援：用 yfinance Ticker.info 逐檔抓，為了速度只抓內建/前 250 檔。
+        rows=[]
+        limited = info_df.head(250).copy()
+        for _, r in limited.iterrows():
+            sym = f"{r['代號']}{'.TW' if r['市場']=='上市' else '.TWO'}"
+            try:
+                tk = yf.Ticker(sym)
+                q = tk.info or {}
+                pe = first_notna(q.get('trailingPE'), q.get('forwardPE'))
+                price = first_notna(q.get('regularMarketPrice'), q.get('currentPrice'), q.get('previousClose'))
+                if pd.isna(to_number(pe)) or to_number(pe) <= 0:
+                    continue
+                rows.append({
+                    "代號": r['代號'],
+                    "名稱": first_notna(q.get('shortName'), q.get('longName'), r['名稱']),
+                    "產業別": r['產業別'],
+                    "市場": r['市場'],
+                    "估值資料日期": _date_str(0),
+                    "本益比": to_number(pe),
+                    "股價淨值比": to_number(q.get('priceToBook')),
+                    "殖利率%": _yahoo_percent(first_notna(q.get('trailingAnnualDividendYield'), q.get('dividendYield'))),
+                    "收盤價": to_number(price),
+                    "今日成交量張": to_number(q.get('volume')) / 1000,
+                    "yfinance代號": sym,
+                    "資料源": "Yahoo逐檔備援",
+                })
+            except Exception:
+                pass
+            time.sleep(0.02)
+        base = pd.DataFrame(rows)
+        if not base.empty:
+            for col in ["營收年度", "營收月份", "月營收", "月營收MoM%", "月營收YoY%", "累計營收YoY%"]:
+                if col not in base.columns:
+                    base[col] = np.nan
+            base = compute_industry_relative_columns(base).reset_index(drop=True)
+            messages.append("Yahoo 批次估值失敗，已改用 Yahoo 逐檔備援；為了速度只抓部分股票池。")
+
+    if base.empty:
+        for m in messages:
+            st.warning(m)
+        return pd.DataFrame()
+
+    if include_revenue:
+        # 穩定模式不再硬抓官方月營收。能抓到 FinMind 月營收就補，失敗也不影響主篩選。
+        try:
+            revenue_raw = finmind_request("TaiwanStockMonthRevenue", token=token, start_date=_date_str(430), end_date=_date_str(0))
+            revenue_df = normalize_finmind_revenue(revenue_raw)
+            if not revenue_df.empty:
+                base = base.merge(revenue_df, on="代號", how="left", suffixes=("", "_rev"))
+        except Exception as exc:
+            messages.append(f"月營收自動補充失敗，已略過月營收欄位：{exc}")
+
+    for col in ["營收年度", "營收月份", "月營收", "月營收MoM%", "月營收YoY%", "累計營收YoY%"]:
+        if col not in base.columns:
+            base[col] = np.nan
+    for m in messages:
+        st.warning(m)
+    st.info("目前使用 Yahoo 穩定資料模式：避開 TWSE/TPEX 官方 API。估值資料請於交易前再與券商或官方資料交叉確認。")
+    return base.reset_index(drop=True)
+
 
 def compute_industry_relative_columns(base: pd.DataFrame) -> pd.DataFrame:
     if base.empty:
@@ -1714,9 +1926,9 @@ with st.sidebar:
     st.subheader("資料源設定")
     data_source_mode = st.selectbox(
         "資料源模式",
-        ["FinMind優先（建議）", "只用FinMind", "官方API優先", "只用官方API"],
+        ["Yahoo穩定模式（建議）", "FinMind優先", "只用FinMind", "官方API優先", "只用官方API"],
         index=0,
-        help="TWSE 官方 API 在 Streamlit Cloud 有時會回傳 HTML；建議使用 FinMind 優先模式。",
+        help="若 TWSE/TPEX 或 FinMind 在 Streamlit Cloud 連線不穩，請使用 Yahoo穩定模式。",
     )
     try:
         default_finmind_token = st.secrets.get("FINMIND_TOKEN", "")
@@ -1887,24 +2099,34 @@ if run:
 
     with st.spinner("下載估值、行情與月營收資料中……"):
         base = pd.DataFrame()
-        finmind_first = data_source_mode in ["FinMind優先（建議）", "只用FinMind"]
-        official_allowed = data_source_mode in ["FinMind優先（建議）", "官方API優先", "只用官方API"]
-        finmind_allowed = data_source_mode in ["FinMind優先（建議）", "官方API優先", "只用FinMind"]
 
-        if finmind_first and finmind_allowed:
-            base = load_finmind_data(include_twse, include_tpex, include_revenue=use_revenue_filter, token=finmind_token)
-            if not base.empty:
-                st.success(f"已使用 FinMind 自動資料源取得資料：{len(base):,} 筆")
+        if data_source_mode == "Yahoo穩定模式（建議)":
+            # 兼容意外的全形/半形括號輸入；實際選單使用下面 startswith 判斷。
+            pass
 
-        if base.empty and official_allowed:
-            base = load_official_data(include_twse, include_tpex, include_revenue=use_revenue_filter)
+        if data_source_mode.startswith("Yahoo穩定模式"):
+            base = load_yahoo_stable_data(include_twse, include_tpex, include_revenue=use_revenue_filter, token=finmind_token)
             if not base.empty:
-                st.info(f"已使用官方 API 資料源取得資料：{len(base):,} 筆")
+                st.success(f"已使用 Yahoo 穩定模式取得資料：{len(base):,} 筆")
+        else:
+            finmind_first = data_source_mode in ["FinMind優先", "只用FinMind"]
+            official_allowed = data_source_mode in ["FinMind優先", "官方API優先", "只用官方API"]
+            finmind_allowed = data_source_mode in ["FinMind優先", "官方API優先", "只用FinMind"]
 
-        if base.empty and (not finmind_first) and finmind_allowed:
-            base = load_finmind_data(include_twse, include_tpex, include_revenue=use_revenue_filter, token=finmind_token)
-            if not base.empty:
-                st.success(f"官方 API 失敗後，已改用 FinMind 取得資料：{len(base):,} 筆")
+            if finmind_first and finmind_allowed:
+                base = load_finmind_data(include_twse, include_tpex, include_revenue=use_revenue_filter, token=finmind_token)
+                if not base.empty:
+                    st.success(f"已使用 FinMind 自動資料源取得資料：{len(base):,} 筆")
+
+            if base.empty and official_allowed:
+                base = load_official_data(include_twse, include_tpex, include_revenue=use_revenue_filter)
+                if not base.empty:
+                    st.info(f"已使用官方 API 資料源取得資料：{len(base):,} 筆")
+
+            if base.empty and (not finmind_first) and finmind_allowed:
+                base = load_finmind_data(include_twse, include_tpex, include_revenue=use_revenue_filter, token=finmind_token)
+                if not base.empty:
+                    st.success(f"官方 API 失敗後，已改用 FinMind 取得資料：{len(base):,} 筆")
 
     uploaded_twse_base = build_uploaded_twse_data(
         uploaded_twse_pe,
@@ -1923,7 +2145,7 @@ if run:
         st.success(f"已套用上傳的上市備援資料：{len(uploaded_twse_base):,} 筆")
 
     if base.empty:
-        st.error("沒有取得資料。可能是 FinMind / 官方 API 暫時無法連線、API 額度受限，或回傳格式有變。可以先填入 FinMind token、改成「官方API優先」，或使用左側的備援上傳。")
+        st.error("沒有取得資料。請先確認資料源模式選「Yahoo穩定模式（建議）」，並把「沒有月營收資料者直接排除」關閉；若仍失敗，可降低最多下載檔數或稍後重試。")
         st.stop()
 
     # 手動股票代號模式先套用，避免全市場過濾後找不到自選股。
